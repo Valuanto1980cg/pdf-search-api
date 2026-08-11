@@ -10,18 +10,9 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-
-# =====================================================
-# CONFIGURACION GENERAL
-# =====================================================
-
 API_KEY = os.environ.get("PDF_API_KEY", "CAMBIAR_POR_UNA_CLAVE_SEGURA")
 MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(45 * 1024 * 1024)))
 
-
-# =====================================================
-# SEGURIDAD
-# =====================================================
 
 def check_api_key(req) -> bool:
     incoming = req.headers.get("X-API-Key", "")
@@ -34,10 +25,6 @@ def unauthorized_response():
         "error": "API key invalida o ausente."
     }), 401
 
-
-# =====================================================
-# NORMALIZACION DE TEXTO
-# =====================================================
 
 def normalize_text(value: Any) -> str:
     if value is None:
@@ -90,13 +77,8 @@ def normalize_for_search(value: Any) -> str:
 
 def normalize_words(value: Any) -> Listtext = normalize_for_search(value)
     text = re.sub(r"[^a-z0-9\s]", " ", text)
-    parts = [p.strip() for p in text.split() if p.strip()]
-    return parts
+    return [p.strip() for p in text.split() if p.strip()]
 
-
-# =====================================================
-# PDF
-# =====================================================
 
 def decode_pdf_base64(pdf_base64: str) -> bytes:
     if not pdf_base64:
@@ -145,10 +127,6 @@ def cleanup_temp(path: str) -> None:
         pass
 
 
-# =====================================================
-# EXTRACCION Y BUSQUEDA
-# =====================================================
-
 def get_page_text(page) -> str:
     try:
         text = page.get_text("text") or ""
@@ -171,31 +149,6 @@ def get_page_blocks_text(page) -> str:
         return normalize_text("\n".join(parts))
     except Exception:
         return ""
-
-
-def extract_snippet(page_text: str, phrase: str, radius: int = 260) -> str:
-    page_text = normalize_text(page_text)
-
-    if not page_text:
-        return ""
-
-    search_text = normalize_for_search(page_text)
-    search_phrase = normalize_for_search(phrase)
-
-    idx = search_text.find(search_phrase)
-
-    if idx == -1:
-        words = normalize_words(phrase)
-        if words:
-            idx = search_text.find(words[0])
-
-    if idx == -1:
-        return normalize_text(page_text[:520])
-
-    start = max(0, idx - radius)
-    end = min(len(page_text), idx + len(phrase) + radius)
-
-    return normalize_text(page_text[start:end])
 
 
 def exact_match(page_text: str, phrase: str) -> bool:
@@ -225,6 +178,31 @@ def flexible_match(page_text: str, phrase: str) -> bool:
     return ratio >= 0.72
 
 
+def extract_snippet(page_text: str, phrase: str, radius: int = 260) -> str:
+    page_text = normalize_text(page_text)
+
+    if not page_text:
+        return ""
+
+    search_text = normalize_for_search(page_text)
+    search_phrase = normalize_for_search(phrase)
+
+    idx = search_text.find(search_phrase)
+
+    if idx == -1:
+        words = normalize_words(phrase)
+        if words:
+            idx = search_text.find(words[0])
+
+    if idx == -1:
+        return normalize_text(page_text[:520])
+
+    start = max(0, idx - radius)
+    end = min(len(page_text), idx + len(phrase) + radius)
+
+    return normalize_text(page_text[start:end])
+
+
 def search_pdf_bytes(
     pdf_bytes: bytes,
     phrase: str,
@@ -244,7 +222,6 @@ def search_pdf_bytes(
 
     doc = None
     tmp_path = ""
-
     matches: List[Dict[str, Any]] = []
     total_pages = 0
     pages_with_text = 0
@@ -391,17 +368,13 @@ def analyze_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
         cleanup_temp(tmp_path)
 
 
-# =====================================================
-# RUTAS API
-# =====================================================
-
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.0.0",
+        "version": "1.0.2",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
@@ -419,7 +392,7 @@ def health():
         "ok": True,
         "service": "PDF Search API",
         "engine": "PyMuPDF",
-        "version": "1.0.0"
+        "version": "1.0.2"
     })
 
 
@@ -506,10 +479,6 @@ def search():
 
     return jsonify(result)
 
-
-# =====================================================
-# EJECUCION LOCAL
-# =====================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))

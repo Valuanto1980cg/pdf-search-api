@@ -374,7 +374,7 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.0.2",
+        "version": "1.0.3",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
@@ -392,7 +392,7 @@ def health():
         "ok": True,
         "service": "PDF Search API",
         "engine": "PyMuPDF",
-        "version": "1.0.2"
+        "version": "1.0.3"
     })
 
 

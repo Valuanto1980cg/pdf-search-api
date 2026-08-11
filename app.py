@@ -151,6 +151,111 @@ def extract_snippet(page_text: str, phrase: str, radius: int = 260) -> str:
     return normalize_text(page_text[start:end])
 
 
+def article_header_regex(article_number: str):
+    article_number = str(article_number or "").strip()
+    return re.compile(
+        r"(^|[\n\r\s])art[íi]culo\s+" + re.escape(article_number) + r"\s*(\.|-|:|—|–)?",
+        re.IGNORECASE,
+    )
+
+
+def any_article_header_regex():
+    return re.compile(r"(^|[\n\r\s])art[íi]culo\s+\d+\s*(\.|-|:|—|–)?", re.IGNORECASE)
+
+
+def find_article_matches_in_pdf_bytes(pdf_bytes: bytes, article_number: str, include_text: bool = True) -> Dict[str, Any]:
+    article_number = re.sub(r"[^0-9]", "", str(article_number or ""))
+    if not article_number:
+        return {"ok": False, "found": False, "error": "Debe indicar numero de articulo.", "matches": []}
+
+    doc = None
+    tmp_path = ""
+    matches: List[Dict[str, Any]] = []
+    total_pages = 0
+    pages_with_text = 0
+
+    try:
+        doc, tmp_path = open_pdf_from_bytes(pdf_bytes)
+        total_pages = doc.page_count
+        target_re = article_header_regex(article_number)
+        next_re = any_article_header_regex()
+
+        for page_index in range(total_pages):
+            page = doc.load_page(page_index)
+            text = get_page_text(page)
+            if not text:
+                text = get_page_blocks_text(page)
+            if normalize_text(text):
+                pages_with_text += 1
+
+            target_match = target_re.search(text or "")
+            if not target_match:
+                continue
+
+            start = target_match.start()
+            after = text[target_match.end():]
+            next_match = next_re.search(after)
+            end = target_match.end() + next_match.start() if next_match else len(text)
+            article_text = normalize_text(text[start:end])
+
+            # Si el articulo esta cortado al final de la pagina, intenta continuar en la pagina siguiente
+            if not next_match and page_index + 1 < total_pages:
+                next_page = doc.load_page(page_index + 1)
+                next_text = get_page_text(next_page) or get_page_blocks_text(next_page)
+                next_header = next_re.search(next_text or "")
+                extension = next_text[:next_header.start()] if next_header else next_text[:1600]
+                if extension:
+                    article_text = normalize_text(article_text + "\n" + extension)
+
+            snippet = article_text[:520].strip()
+            if len(article_text) > 520:
+                snippet += "..."
+
+            match_data = {
+                "page_index": page_index,
+                "page_number": page_index + 1,
+                "article": article_number,
+                "header": target_match.group(0).strip(),
+                "snippet": snippet,
+                "article_text": article_text,
+                "text_length": len(text or ""),
+                "match_type": "article_header_exact",
+            }
+            if include_text:
+                match_data["page_text"] = text
+            matches.append(match_data)
+            break
+
+        return {
+            "ok": True,
+            "found": len(matches) > 0,
+            "message": "Articulo encontrado" if matches else "Articulo no encontrado",
+            "article": article_number,
+            "total_pages": total_pages,
+            "pages_with_text": pages_with_text,
+            "requires_ocr": total_pages > 0 and pages_with_text == 0,
+            "matches": matches,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "found": False,
+            "error": str(exc),
+            "article": article_number,
+            "total_pages": total_pages,
+            "pages_with_text": pages_with_text,
+            "requires_ocr": False,
+            "matches": [],
+        }
+    finally:
+        try:
+            if doc:
+                doc.close()
+        except Exception:
+            pass
+        cleanup_temp(tmp_path)
+
+
 def search_pdf_bytes(pdf_bytes: bytes, phrase: str, all_pages: bool = False, exact: bool = True, include_text: bool = False) -> Dict[str, Any]:
     phrase = normalize_text(phrase)
     if not phrase:
@@ -279,7 +384,7 @@ def index():
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
         "version": "1.0.2",
-        "endpoints": {"health": "/health", "analyze": "/analyze", "search": "/search"}
+        "endpoints": {"health": "/health", "analyze": "/analyze", "search": "/search", "article": "/article"}
     })
 
 
@@ -314,6 +419,21 @@ def analyze():
     result["mimeType"] = mime_type
     result["sizeBytes"] = size_bytes
     return jsonify(result)
+
+
+@app.route("/article", methods=["POST"])
+def article():
+    if not check_api_key(request):
+        return unauthorized_response()
+    data = request.get_json(silent=True) or {}
+    try:
+        pdf_bytes = decode_pdf_base64(data.get("pdf_base64", ""))
+        article_number = str(data.get("article_number") or data.get("articulo") or data.get("article") or "").strip()
+        include_text = bool(data.get("include_text", True))
+        result = find_article_matches_in_pdf_bytes(pdf_bytes, article_number, include_text=include_text)
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"ok": False, "found": False, "error": str(exc), "matches": []}), 400
 
 
 @app.route("/search", methods=["POST"])

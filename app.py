@@ -7,7 +7,6 @@ from typing import Any, Dict, List
 import fitz
 from flask import Flask, jsonify, request
 
-
 app = Flask(__name__)
 
 API_KEY = os.environ.get("PDF_API_KEY", "CAMBIAR_POR_UNA_CLAVE_SEGURA")
@@ -20,62 +19,38 @@ def check_api_key(req) -> bool:
 
 
 def unauthorized_response():
-    return jsonify({
-        "ok": False,
-        "error": "API key invalida o ausente."
-    }), 401
+    return jsonify({"ok": False, "error": "API key invalida o ausente."}), 401
 
 
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
-
     value = str(value)
     value = value.replace("\u00a0", " ")
     value = value.replace("\r", "\n")
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
-
     return value.strip()
 
 
 def normalize_for_search(value: Any) -> str:
     value = normalize_text(value).lower()
-
     replacements = {
-        "á": "a",
-        "à": "a",
-        "ä": "a",
-        "â": "a",
-        "é": "e",
-        "è": "e",
-        "ë": "e",
-        "ê": "e",
-        "í": "i",
-        "ì": "i",
-        "ï": "i",
-        "î": "i",
-        "ó": "o",
-        "ò": "o",
-        "ö": "o",
-        "ô": "o",
-        "ú": "u",
-        "ù": "u",
-        "ü": "u",
-        "û": "u",
-        "ñ": "n",
-        "—": "-",
-        "–": "-"
+        "á": "a", "à": "a", "ä": "a", "â": "a",
+        "é": "e", "è": "e", "ë": "e", "ê": "e",
+        "í": "i", "ì": "i", "ï": "i", "î": "i",
+        "ó": "o", "ò": "o", "ö": "o", "ô": "o",
+        "ú": "u", "ù": "u", "ü": "u", "û": "u",
+        "ñ": "n", "—": "-", "–": "-"
     }
-
     for src, dst in replacements.items():
         value = value.replace(src, dst)
-
     value = re.sub(r"\s+", " ", value)
     return value.strip()
 
 
-def normalize_words(value: Any) -> Listtext = normalize_for_search(value)
+def normalize_words(value: Any) -> List[str]:
+    text = normalize_for_search(value)
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return [p.strip() for p in text.split() if p.strip()]
 
@@ -83,21 +58,16 @@ def normalize_words(value: Any) -> Listtext = normalize_for_search(value)
 def decode_pdf_base64(pdf_base64: str) -> bytes:
     if not pdf_base64:
         raise ValueError("No se recibio pdf_base64.")
-
     try:
         pdf_bytes = base64.b64decode(pdf_base64)
     except Exception as exc:
         raise ValueError(f"No se pudo decodificar pdf_base64: {str(exc)}")
-
     if not pdf_bytes:
         raise ValueError("El PDF decodificado esta vacio.")
-
     if len(pdf_bytes) > MAX_PDF_BYTES:
         raise ValueError(
-            f"El PDF supera el tamano maximo permitido. "
-            f"Tamano: {len(pdf_bytes)} bytes. Maximo: {MAX_PDF_BYTES} bytes."
+            f"El PDF supera el tamano maximo permitido. Tamano: {len(pdf_bytes)} bytes. Maximo: {MAX_PDF_BYTES} bytes."
         )
-
     return pdf_bytes
 
 
@@ -106,7 +76,6 @@ def open_pdf_from_bytes(pdf_bytes: bytes):
     tmp.write(pdf_bytes)
     tmp.flush()
     tmp.close()
-
     try:
         doc = fitz.open(tmp.name)
         return doc, tmp.name
@@ -115,7 +84,6 @@ def open_pdf_from_bytes(pdf_bytes: bytes):
             os.remove(tmp.name)
         except Exception:
             pass
-
         raise ValueError(f"No se pudo abrir el PDF con PyMuPDF: {str(exc)}")
 
 
@@ -129,8 +97,7 @@ def cleanup_temp(path: str) -> None:
 
 def get_page_text(page) -> str:
     try:
-        text = page.get_text("text") or ""
-        return normalize_text(text)
+        return normalize_text(page.get_text("text") or "")
     except Exception:
         return ""
 
@@ -139,13 +106,11 @@ def get_page_blocks_text(page) -> str:
     try:
         blocks = page.get_text("blocks") or []
         parts = []
-
         for block in blocks:
             if len(block) >= 5:
                 text = str(block[4] or "").strip()
                 if text:
                     parts.append(text)
-
         return normalize_text("\n".join(parts))
     except Exception:
         return ""
@@ -158,114 +123,68 @@ def exact_match(page_text: str, phrase: str) -> bool:
 def flexible_match(page_text: str, phrase: str) -> bool:
     page_norm = normalize_for_search(page_text)
     words = normalize_words(phrase)
-
     if not words:
         return False
-
     important_words = [w for w in words if len(w) >= 4]
-
     if not important_words:
         important_words = words
-
-    hits = 0
-
-    for word in important_words:
-        if word in page_norm:
-            hits += 1
-
+    hits = sum(1 for word in important_words if word in page_norm)
     ratio = hits / float(len(important_words))
-
     return ratio >= 0.72
 
 
 def extract_snippet(page_text: str, phrase: str, radius: int = 260) -> str:
     page_text = normalize_text(page_text)
-
     if not page_text:
         return ""
-
     search_text = normalize_for_search(page_text)
     search_phrase = normalize_for_search(phrase)
-
     idx = search_text.find(search_phrase)
-
     if idx == -1:
         words = normalize_words(phrase)
         if words:
             idx = search_text.find(words[0])
-
     if idx == -1:
         return normalize_text(page_text[:520])
-
     start = max(0, idx - radius)
     end = min(len(page_text), idx + len(phrase) + radius)
-
     return normalize_text(page_text[start:end])
 
 
-def search_pdf_bytes(
-    pdf_bytes: bytes,
-    phrase: str,
-    all_pages: bool = False,
-    exact: bool = True,
-    include_text: bool = False
-) -> Dict[str, Any]:
+def search_pdf_bytes(pdf_bytes: bytes, phrase: str, all_pages: bool = False, exact: bool = True, include_text: bool = False) -> Dict[str, Any]:
     phrase = normalize_text(phrase)
-
     if not phrase:
-        return {
-            "ok": False,
-            "found": False,
-            "error": "Debe indicar una frase a buscar.",
-            "matches": []
-        }
-
+        return {"ok": False, "found": False, "error": "Debe indicar una frase a buscar.", "matches": []}
     doc = None
     tmp_path = ""
     matches: List[Dict[str, Any]] = []
     total_pages = 0
     pages_with_text = 0
-
     try:
         doc, tmp_path = open_pdf_from_bytes(pdf_bytes)
         total_pages = doc.page_count
-
         for page_index in range(total_pages):
             page = doc.load_page(page_index)
             text = get_page_text(page)
-
             if not text:
                 text = get_page_blocks_text(page)
-
             if normalize_text(text):
                 pages_with_text += 1
-
-            if exact:
-                found = exact_match(text, phrase)
-            else:
-                found = flexible_match(text, phrase)
-
+            found = exact_match(text, phrase) if exact else flexible_match(text, phrase)
             if found:
-                snippet = extract_snippet(text, phrase)
-
                 match_data = {
                     "page_index": page_index,
                     "page_number": page_index + 1,
-                    "snippet": snippet,
+                    "snippet": extract_snippet(text, phrase),
                     "text_length": len(text),
                     "match_type": "exact" if exact else "flexible"
                 }
-
                 if include_text:
                     match_data["page_text"] = text
-
                 matches.append(match_data)
-
                 if not all_pages:
                     break
-
         requires_ocr = total_pages > 0 and pages_with_text == 0
-
         return {
             "ok": True,
             "found": len(matches) > 0,
@@ -278,7 +197,6 @@ def search_pdf_bytes(
             "requires_ocr": requires_ocr,
             "matches": matches
         }
-
     except Exception as exc:
         return {
             "ok": False,
@@ -289,44 +207,35 @@ def search_pdf_bytes(
             "requires_ocr": False,
             "matches": []
         }
-
     finally:
         try:
             if doc:
                 doc.close()
         except Exception:
             pass
-
         cleanup_temp(tmp_path)
 
 
 def analyze_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
     doc = None
     tmp_path = ""
-
     total_pages = 0
     pages_with_text = 0
     pages_empty = 0
     sample_pages = []
-
     try:
         doc, tmp_path = open_pdf_from_bytes(pdf_bytes)
         total_pages = doc.page_count
-
         for page_index in range(total_pages):
             page = doc.load_page(page_index)
             text = get_page_text(page)
-
             if not text:
                 text = get_page_blocks_text(page)
-
             length = len(normalize_text(text))
-
             if length > 0:
                 pages_with_text += 1
             else:
                 pages_empty += 1
-
             if page_index < 5:
                 sample_pages.append({
                     "page_index": page_index,
@@ -334,9 +243,7 @@ def analyze_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
                     "text_length": length,
                     "preview": normalize_text(text[:360]) if text else ""
                 })
-
         requires_ocr = total_pages > 0 and pages_with_text == 0
-
         return {
             "ok": True,
             "total_pages": total_pages,
@@ -346,7 +253,6 @@ def analyze_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
             "text_coverage_ratio": pages_with_text / float(total_pages) if total_pages else 0,
             "sample_pages": sample_pages
         }
-
     except Exception as exc:
         return {
             "ok": False,
@@ -357,14 +263,12 @@ def analyze_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
             "requires_ocr": False,
             "sample_pages": sample_pages
         }
-
     finally:
         try:
             if doc:
                 doc.close()
         except Exception:
             pass
-
         cleanup_temp(tmp_path)
 
 
@@ -374,12 +278,8 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.0.3",
-        "endpoints": {
-            "health": "/health",
-            "analyze": "/analyze",
-            "search": "/search"
-        }
+        "version": "1.0.2",
+        "endpoints": {"health": "/health", "analyze": "/analyze", "search": "/search"}
     })
 
 
@@ -387,27 +287,18 @@ def index():
 def health():
     if not check_api_key(request):
         return unauthorized_response()
-
-    return jsonify({
-        "ok": True,
-        "service": "PDF Search API",
-        "engine": "PyMuPDF",
-        "version": "1.0.3"
-    })
+    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF", "version": "1.0.2"})
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
     if not check_api_key(request):
         return unauthorized_response()
-
     data = request.get_json(silent=True) or {}
-
     pdf_base64 = data.get("pdf_base64", "")
     filename = data.get("filename", "")
     mime_type = data.get("mimeType", "")
     size_bytes = data.get("sizeBytes", 0)
-
     try:
         pdf_bytes = decode_pdf_base64(pdf_base64)
     except Exception as exc:
@@ -418,12 +309,10 @@ def analyze():
             "mimeType": mime_type,
             "sizeBytes": size_bytes
         }), 400
-
     result = analyze_pdf_bytes(pdf_bytes)
     result["filename"] = filename
     result["mimeType"] = mime_type
     result["sizeBytes"] = size_bytes
-
     return jsonify(result)
 
 
@@ -431,27 +320,17 @@ def analyze():
 def search():
     if not check_api_key(request):
         return unauthorized_response()
-
     data = request.get_json(silent=True) or {}
-
     pdf_base64 = data.get("pdf_base64", "")
     phrase = data.get("phrase", "")
     filename = data.get("filename", "")
     mime_type = data.get("mimeType", "")
     size_bytes = data.get("sizeBytes", 0)
-
     all_pages = bool(data.get("all_pages", False))
     exact = bool(data.get("exact", True))
     include_text = bool(data.get("include_text", False))
-
     if not phrase:
-        return jsonify({
-            "ok": False,
-            "found": False,
-            "error": "Debe indicar phrase.",
-            "matches": []
-        }), 400
-
+        return jsonify({"ok": False, "found": False, "error": "Debe indicar phrase.", "matches": []}), 400
     try:
         pdf_bytes = decode_pdf_base64(pdf_base64)
     except Exception as exc:
@@ -464,7 +343,6 @@ def search():
             "mimeType": mime_type,
             "sizeBytes": size_bytes
         }), 400
-
     result = search_pdf_bytes(
         pdf_bytes=pdf_bytes,
         phrase=phrase,
@@ -472,11 +350,9 @@ def search():
         exact=exact,
         include_text=include_text
     )
-
     result["filename"] = filename
     result["mimeType"] = mime_type
     result["sizeBytes"] = size_bytes
-
     return jsonify(result)
 
 

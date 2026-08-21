@@ -1,3 +1,8 @@
+app.py
+Pulse el botón para copiar únicamente el código fuente, sin encabezados ni texto adicional.
+
+Copiar todo el código
+Código copiado correctamente
 import base64
 import os
 import re
@@ -503,13 +508,14 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
             "search": "/search",
             "article": "/article",
-            "ingestar_pdf_modular": "/ingestar_pdf_modular"
+            "ingestar_pdf_modular": "/ingestar_pdf_modular",
+            "ingestar_pdf_modular_lote": "/ingestar_pdf_modular_lote"
         }
     })
 
@@ -518,7 +524,7 @@ def index():
 def health():
     if not check_api_key(request):
         return unauthorized_response()
-    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF", "version": "1.1.0"})
+    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF", "version": "1.2.0"})
 
 
 @app.route("/analyze", methods=["POST"])
@@ -580,6 +586,256 @@ def search():
     result["mimeType"] = mime_type
     result["sizeBytes"] = size_bytes
     return jsonify(result)
+
+
+
+
+def modular_process_page_range(
+    doc,
+    data: Dict[str, Any],
+    page_start: int,
+    page_end: int,
+    fragment_size: int,
+    fragment_overlap: int,
+) -> Dict[str, Any]:
+    total_pages = int(doc.page_count or 0)
+
+    if total_pages <= 0:
+        return {
+            "fragmentos": [],
+            "totalCaracteresTextoLote": 0,
+            "paginaInicioProcesada": 0,
+            "paginaFinProcesada": 0,
+        }
+
+    page_start = max(1, int(page_start or 1))
+    page_end = min(total_pages, int(page_end or page_start))
+
+    if page_start > total_pages:
+        raise ValueError(
+            f"paginaInicio ({page_start}) supera el total de paginas ({total_pages})."
+        )
+
+    if page_end < page_start:
+        raise ValueError(
+            f"Rango de paginas invalido: {page_start}-{page_end}."
+        )
+
+    id_documento = str(
+        data.get("idDocumento") or data.get("id_documento") or ""
+    ).strip()
+
+    fragmentos: List[Dict[str, Any]] = []
+    total_text_chars = 0
+
+    for page_index in range(page_start - 1, page_end):
+        page = doc.load_page(page_index)
+        page_number = page_index + 1
+        page_text = get_page_text(page)
+
+        if not page_text:
+            page_text = get_page_blocks_text(page)
+
+        page_text = normalize_text(page_text)
+        total_text_chars += len(page_text)
+
+        if not page_text:
+            continue
+
+        title = modular_detect_page_title(page_text)
+        page_fragments = modular_split_page_text(
+            page_text,
+            size=fragment_size,
+            overlap=fragment_overlap,
+        )
+
+        for fragment_index, fragment_text in enumerate(
+            page_fragments,
+            start=1,
+        ):
+            fragment_type = modular_classify_fragment(
+                fragment_text,
+                title,
+            )
+            fragment_id = (
+                f"PYMUPDF-{id_documento}-P{page_number}-F{fragment_index}"
+            )
+            keywords = modular_extract_keywords(
+                fragment_text,
+                title,
+                data.get("documentoDestino") or "",
+            )
+
+            fragmentos.append({
+                "idFragmento": fragment_id,
+                "idDocumento": id_documento,
+                "moduloPrincipal": data.get("moduloPrincipal") or "",
+                "modulosRelacionados": data.get("modulosRelacionados") or "",
+                "documentoDestino": data.get("documentoDestino") or "",
+                "tipoFuente": data.get("tipoFuente") or "",
+                "pagina": page_number,
+                "tituloDetectado": title,
+                "subtituloDetectado": "",
+                "tipoFragmento": fragment_type,
+                "textoFragmento": fragment_text,
+                "textoNormalizado": normalize_for_search(fragment_text),
+                "palabrasClave": keywords,
+                "usoIA": data.get("tipoUsoIA") or "BUSQUEDA;CONTEXTO_GEMINI",
+                "prioridad": data.get("prioridad") or "",
+                "fuenteVisible": (
+                    data.get("nombreFuente")
+                    or data.get("filename")
+                    or "Documento PDF"
+                ),
+                "estado": "ACTIVO",
+                "motorExtraccion": "PYTHON_PYMUPDF_LOTE",
+                "observaciones": (
+                    "Fragmento extraido por /ingestar_pdf_modular_lote."
+                ),
+            })
+
+    return {
+        "fragmentos": fragmentos,
+        "totalCaracteresTextoLote": total_text_chars,
+        "paginaInicioProcesada": page_start,
+        "paginaFinProcesada": page_end,
+    }
+
+
+@app.route("/ingestar_pdf_modular_lote", methods=["POST"])
+def ingestar_pdf_modular_lote():
+    if not check_api_key(request):
+        return unauthorized_response()
+
+    data = request.get_json(silent=True) or {}
+    pdf_base64 = data.get("pdf_base64") or data.get("pdfBase64") or ""
+
+    if not pdf_base64:
+        return jsonify({
+            "ok": False,
+            "error": "PDF_BASE64_REQUERIDO",
+            "mensaje": "Debe enviar pdf_base64 en el cuerpo JSON.",
+        }), 400
+
+    id_documento = str(
+        data.get("idDocumento") or data.get("id_documento") or ""
+    ).strip()
+
+    if not id_documento:
+        return jsonify({
+            "ok": False,
+            "error": "ID_DOCUMENTO_REQUERIDO",
+            "mensaje": "Debe enviar idDocumento.",
+        }), 400
+
+    try:
+        pagina_inicio = int(
+            data.get("paginaInicio") or data.get("pagina_inicio") or 1
+        )
+        pagina_fin = int(
+            data.get("paginaFin") or data.get("pagina_fin") or pagina_inicio
+        )
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "error": "RANGO_PAGINAS_INVALIDO",
+            "mensaje": "paginaInicio y paginaFin deben ser numeros enteros.",
+        }), 400
+
+    try:
+        pdf_bytes = decode_pdf_base64(pdf_base64)
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "PDF_INVALIDO",
+            "mensaje": str(exc),
+        }), 400
+
+    instrucciones = data.get("instruccionesExtraccion") or {}
+
+    try:
+        fragment_size = int(
+            instrucciones.get("tamanoFragmentoCaracteres") or 1800
+        )
+    except Exception:
+        fragment_size = 1800
+
+    try:
+        fragment_overlap = int(
+            instrucciones.get("solapamientoCaracteres") or 250
+        )
+    except Exception:
+        fragment_overlap = 250
+
+    doc = None
+    tmp_path = ""
+
+    try:
+        doc, tmp_path = open_pdf_from_bytes(pdf_bytes)
+        total_pages = int(doc.page_count or 0)
+        processed = modular_process_page_range(
+            doc=doc,
+            data=data,
+            page_start=pagina_inicio,
+            page_end=pagina_fin,
+            fragment_size=fragment_size,
+            fragment_overlap=fragment_overlap,
+        )
+
+        pagina_fin_procesada = processed["paginaFinProcesada"]
+        hay_mas_paginas = pagina_fin_procesada < total_pages
+        siguiente_pagina = (
+            pagina_fin_procesada + 1 if hay_mas_paginas else None
+        )
+
+        return jsonify({
+            "ok": True,
+            "modoProcesamiento": "LOTE_PAGINAS",
+            "idDocumento": id_documento,
+            "moduloPrincipal": data.get("moduloPrincipal") or "",
+            "modulosRelacionados": data.get("modulosRelacionados") or "",
+            "tipoFuente": data.get("tipoFuente") or "",
+            "documentoDestino": data.get("documentoDestino") or "",
+            "nombreFuente": data.get("nombreFuente") or data.get("filename") or "",
+            "driveId": data.get("driveId") or "",
+            "urlDrive": data.get("urlDrive") or "",
+            "prioridad": data.get("prioridad") or "",
+            "tipoUsoIA": data.get("tipoUsoIA") or "BUSQUEDA;CONTEXTO_GEMINI",
+            "motorExtraccion": "PYTHON_PYMUPDF_LOTE",
+            "totalPaginas": total_pages,
+            "paginaInicio": processed["paginaInicioProcesada"],
+            "paginaFin": pagina_fin_procesada,
+            "paginasProcesadasLote": (
+                pagina_fin_procesada
+                - processed["paginaInicioProcesada"]
+                + 1
+            ),
+            "totalFragmentos": len(processed["fragmentos"]),
+            "totalCaracteresTexto": processed["totalCaracteresTextoLote"],
+            "hayMasPaginas": hay_mas_paginas,
+            "siguientePagina": siguiente_pagina,
+            "loteCompletado": True,
+            "documentoCompletado": not hay_mas_paginas,
+            "fragmentos": processed["fragmentos"],
+        }), 200
+
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "ERROR_INGESTA_PDF_MODULAR_LOTE",
+            "mensaje": str(exc),
+            "idDocumento": id_documento,
+            "paginaInicio": pagina_inicio,
+            "paginaFin": pagina_fin,
+        }), 500
+
+    finally:
+        try:
+            if doc:
+                doc.close()
+        except Exception:
+            pass
+        cleanup_temp(tmp_path)
 
 
 @app.route("/ingestar_pdf_modular", methods=["POST"])

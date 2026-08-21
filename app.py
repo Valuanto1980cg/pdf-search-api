@@ -1,8 +1,3 @@
-app.py
-Pulse el botón para copiar únicamente el código fuente, sin encabezados ni texto adicional.
-
-Copiar todo el código
-Código copiado correctamente
 import base64
 import os
 import re

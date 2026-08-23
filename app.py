@@ -2,6 +2,7 @@ import base64
 import os
 import re
 import tempfile
+import time
 from typing import Any, Dict, List
 
 import fitz
@@ -85,22 +86,12 @@ def decode_pdf_base64(pdf_base64: str) -> bytes:
 
 
 def open_pdf_from_bytes(pdf_bytes: bytes):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp.write(pdf_bytes)
-    tmp.flush()
-    tmp.close()
-
+    """Abre el PDF directamente desde memoria para evitar E/S temporal lenta."""
     try:
-        doc = fitz.open(tmp.name)
-        return doc, tmp.name
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        return doc, ""
     except Exception as exc:
-        try:
-            os.remove(tmp.name)
-        except Exception:
-            pass
         raise ValueError(f"No se pudo abrir el PDF con PyMuPDF: {str(exc)}")
-
-
 def cleanup_temp(path: str) -> None:
     try:
         if path and os.path.exists(path):
@@ -503,7 +494,7 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
@@ -519,7 +510,7 @@ def index():
 def health():
     if not check_api_key(request):
         return unauthorized_response()
-    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF", "version": "1.2.0"})
+    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF", "version": "1.3.0"})
 
 
 @app.route("/analyze", methods=["POST"])
@@ -699,75 +690,54 @@ def modular_process_page_range(
 
 @app.route("/ingestar_pdf_modular_lote", methods=["POST"])
 def ingestar_pdf_modular_lote():
+    request_started = time.monotonic()
     if not check_api_key(request):
         return unauthorized_response()
 
     data = request.get_json(silent=True) or {}
     pdf_base64 = data.get("pdf_base64") or data.get("pdfBase64") or ""
-
     if not pdf_base64:
-        return jsonify({
-            "ok": False,
-            "error": "PDF_BASE64_REQUERIDO",
-            "mensaje": "Debe enviar pdf_base64 en el cuerpo JSON.",
-        }), 400
+        return jsonify({"ok": False, "error": "PDF_BASE64_REQUERIDO", "mensaje": "Debe enviar pdf_base64 en el cuerpo JSON."}), 400
 
-    id_documento = str(
-        data.get("idDocumento") or data.get("id_documento") or ""
-    ).strip()
-
+    id_documento = str(data.get("idDocumento") or data.get("id_documento") or "").strip()
     if not id_documento:
-        return jsonify({
-            "ok": False,
-            "error": "ID_DOCUMENTO_REQUERIDO",
-            "mensaje": "Debe enviar idDocumento.",
-        }), 400
+        return jsonify({"ok": False, "error": "ID_DOCUMENTO_REQUERIDO", "mensaje": "Debe enviar idDocumento."}), 400
 
     try:
-        pagina_inicio = int(
-            data.get("paginaInicio") or data.get("pagina_inicio") or 1
-        )
-        pagina_fin = int(
-            data.get("paginaFin") or data.get("pagina_fin") or pagina_inicio
-        )
+        pagina_inicio = max(1, int(data.get("paginaInicio") or data.get("pagina_inicio") or 1))
+        pagina_fin_solicitada = int(data.get("paginaFin") or data.get("pagina_fin") or pagina_inicio)
     except Exception:
-        return jsonify({
-            "ok": False,
-            "error": "RANGO_PAGINAS_INVALIDO",
-            "mensaje": "paginaInicio y paginaFin deben ser numeros enteros.",
-        }), 400
+        return jsonify({"ok": False, "error": "RANGO_PAGINAS_INVALIDO", "mensaje": "paginaInicio y paginaFin deben ser numeros enteros."}), 400
 
+    max_paginas_lote = max(1, int(os.environ.get("MAX_PAGINAS_LOTE", "8")))
+    pagina_fin = min(pagina_fin_solicitada, pagina_inicio + max_paginas_lote - 1)
+    timings = {}
+
+    decode_started = time.monotonic()
     try:
         pdf_bytes = decode_pdf_base64(pdf_base64)
     except Exception as exc:
-        return jsonify({
-            "ok": False,
-            "error": "PDF_INVALIDO",
-            "mensaje": str(exc),
-        }), 400
+        return jsonify({"ok": False, "error": "PDF_INVALIDO", "mensaje": str(exc), "idDocumento": id_documento}), 400
+    timings["decodificacionMs"] = round((time.monotonic() - decode_started) * 1000, 2)
 
     instrucciones = data.get("instruccionesExtraccion") or {}
-
     try:
-        fragment_size = int(
-            instrucciones.get("tamanoFragmentoCaracteres") or 1800
-        )
+        fragment_size = int(instrucciones.get("tamanoFragmentoCaracteres") or 1800)
     except Exception:
         fragment_size = 1800
-
     try:
-        fragment_overlap = int(
-            instrucciones.get("solapamientoCaracteres") or 250
-        )
+        fragment_overlap = int(instrucciones.get("solapamientoCaracteres") or 250)
     except Exception:
         fragment_overlap = 250
 
     doc = None
-    tmp_path = ""
-
     try:
-        doc, tmp_path = open_pdf_from_bytes(pdf_bytes)
+        open_started = time.monotonic()
+        doc, _ = open_pdf_from_bytes(pdf_bytes)
+        timings["aperturaMs"] = round((time.monotonic() - open_started) * 1000, 2)
         total_pages = int(doc.page_count or 0)
+
+        process_started = time.monotonic()
         processed = modular_process_page_range(
             doc=doc,
             data=data,
@@ -776,16 +746,16 @@ def ingestar_pdf_modular_lote():
             fragment_size=fragment_size,
             fragment_overlap=fragment_overlap,
         )
-
+        timings["procesamientoMs"] = round((time.monotonic() - process_started) * 1000, 2)
         pagina_fin_procesada = processed["paginaFinProcesada"]
         hay_mas_paginas = pagina_fin_procesada < total_pages
-        siguiente_pagina = (
-            pagina_fin_procesada + 1 if hay_mas_paginas else None
-        )
+        siguiente_pagina = pagina_fin_procesada + 1 if hay_mas_paginas else None
+        timings["totalMs"] = round((time.monotonic() - request_started) * 1000, 2)
 
         return jsonify({
             "ok": True,
-            "modoProcesamiento": "LOTE_PAGINAS",
+            "versionServicio": "1.3.0",
+            "modoProcesamiento": "LOTE_PAGINAS_MEMORIA",
             "idDocumento": id_documento,
             "moduloPrincipal": data.get("moduloPrincipal") or "",
             "modulosRelacionados": data.get("modulosRelacionados") or "",
@@ -796,42 +766,31 @@ def ingestar_pdf_modular_lote():
             "urlDrive": data.get("urlDrive") or "",
             "prioridad": data.get("prioridad") or "",
             "tipoUsoIA": data.get("tipoUsoIA") or "BUSQUEDA;CONTEXTO_GEMINI",
-            "motorExtraccion": "PYTHON_PYMUPDF_LOTE",
+            "motorExtraccion": "PYTHON_PYMUPDF_LOTE_MEMORIA",
             "totalPaginas": total_pages,
             "paginaInicio": processed["paginaInicioProcesada"],
             "paginaFin": pagina_fin_procesada,
-            "paginasProcesadasLote": (
-                pagina_fin_procesada
-                - processed["paginaInicioProcesada"]
-                + 1
-            ),
+            "paginaFinSolicitada": pagina_fin_solicitada,
+            "maxPaginasLote": max_paginas_lote,
+            "paginasProcesadasLote": pagina_fin_procesada - processed["paginaInicioProcesada"] + 1,
             "totalFragmentos": len(processed["fragmentos"]),
             "totalCaracteresTexto": processed["totalCaracteresTextoLote"],
             "hayMasPaginas": hay_mas_paginas,
             "siguientePagina": siguiente_pagina,
             "loteCompletado": True,
             "documentoCompletado": not hay_mas_paginas,
+            "tiempos": timings,
             "fragmentos": processed["fragmentos"],
         }), 200
-
     except Exception as exc:
-        return jsonify({
-            "ok": False,
-            "error": "ERROR_INGESTA_PDF_MODULAR_LOTE",
-            "mensaje": str(exc),
-            "idDocumento": id_documento,
-            "paginaInicio": pagina_inicio,
-            "paginaFin": pagina_fin,
-        }), 500
-
+        timings["totalMs"] = round((time.monotonic() - request_started) * 1000, 2)
+        return jsonify({"ok": False, "versionServicio": "1.3.0", "error": "ERROR_INGESTA_PDF_MODULAR_LOTE", "mensaje": str(exc), "idDocumento": id_documento, "paginaInicio": pagina_inicio, "paginaFin": pagina_fin, "tiempos": timings}), 500
     finally:
         try:
             if doc:
                 doc.close()
         except Exception:
             pass
-        cleanup_temp(tmp_path)
-
 
 @app.route("/ingestar_pdf_modular", methods=["POST"])
 def ingestar_pdf_modular():

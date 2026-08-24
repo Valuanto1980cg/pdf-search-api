@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("PDF_API_KEY", "").strip()
+API_KEY = os.environ.get("PDF_API_KEY", "valor_antiguo")
 MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(45 * 1024 * 1024)))
 
 

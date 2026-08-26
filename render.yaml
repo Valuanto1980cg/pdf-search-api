@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: sicp-pdf-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: PDF_API_KEY
+        sync: false
+      - key: OCR_ENABLED
+        value: "true"
+      - key: OCR_LANGUAGE
+        value: "spa+eng"
+      - key: OCR_DPI
+        value: "180"
+      - key: OCR_MIN_CHARS
+        value: "80"
+      - key: OCR_MAX_PAGES_REQUEST
+        value: "160"
+      - key: MAX_PDF_BYTES
+        value: "83886080"

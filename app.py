@@ -414,6 +414,50 @@ def analyze_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
 # EXPEDIENTE INTELIGENTE - FASE 1
 # OCR selectivo y segmentacion preliminar revisable
 # =====================================================
+
+def configure_tessdata_prefix() -> str:
+    """Localiza los idiomas de Tesseract y configura TESSDATA_PREFIX."""
+    current = str(os.environ.get("TESSDATA_PREFIX", "")).strip()
+
+    candidates = [
+        current,
+        "/opt/tessdata",
+        "/usr/share/tesseract-ocr/5/tessdata",
+        "/usr/share/tesseract-ocr/4.00/tessdata",
+        "/usr/share/tessdata",
+        "/usr/local/share/tessdata",
+    ]
+
+    try:
+        if hasattr(fitz, "get_tessdata"):
+            fitz_tessdata = str(fitz.get_tessdata() or "").strip()
+            if fitz_tessdata:
+                candidates.insert(0, fitz_tessdata)
+    except Exception:
+        pass
+
+    candidates.extend(glob.glob("/usr/share/**/tessdata", recursive=True))
+    candidates.extend(glob.glob("/usr/local/share/**/tessdata", recursive=True))
+
+    checked = set()
+    for candidate in candidates:
+        candidate = str(candidate or "").strip()
+        if not candidate or candidate in checked:
+            continue
+        checked.add(candidate)
+        if not os.path.isdir(candidate):
+            continue
+        traineddata = glob.glob(os.path.join(candidate, "*.traineddata"))
+        if not traineddata:
+            continue
+        os.environ["TESSDATA_PREFIX"] = candidate
+        return candidate
+
+    return ""
+
+
+TESSDATA_DIRECTORY = configure_tessdata_prefix()
+
 OCR_ENABLED = str(os.environ.get("OCR_ENABLED", "true")).strip().lower() not in {"0", "false", "no"}
 OCR_LANGUAGE = str(os.environ.get("OCR_LANGUAGE", "spa+eng")).strip() or "spa+eng"
 OCR_DPI = int(os.environ.get("OCR_DPI", "180"))
@@ -432,6 +476,10 @@ def ocr_page_selective(page, direct_text: str = "") -> Dict[str, Any]:
         "errorOCR": "",
     }
     if len(direct_text) >= OCR_MIN_CHARS or not OCR_ENABLED:
+        return result
+    if not TESSDATA_DIRECTORY:
+        result["ocrIntentado"] = True
+        result["errorOCR"] = "TESSDATA_NO_LOCALIZADO"
         return result
     languages = [OCR_LANGUAGE]
     if OCR_LANGUAGE != "eng":
@@ -586,7 +634,7 @@ def segment_unified_pdf_bytes(pdf_bytes: bytes, filename: str = "", page_start: 
             warnings.append(f"{len(low)} paginas tienen lectura de baja calidad.")
         return {
             "ok": True,
-            "versionServicio": "1.4.0",
+            "versionServicio": "1.4.1",
             "modo": "SEGMENTACION_PRELIMINAR_REVISABLE",
             "filename": filename,
             "totalPaginasDocumento": total_pages,
@@ -713,7 +761,7 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.4.0",
+        "version": "1.4.1",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
@@ -732,7 +780,7 @@ def index():
 def health():
     if not check_api_key(request):
         return unauthorized_response()
-    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF + Tesseract OCR", "version": "1.4.0"})
+    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF + Tesseract OCR", "version": "1.4.1", "tessdataConfigurado": bool(TESSDATA_DIRECTORY)})
 
 
 @app.route("/analyze", methods=["POST"])

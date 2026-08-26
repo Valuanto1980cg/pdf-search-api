@@ -1,5 +1,10 @@
+REEMPLAZAR app.py   RENDER/app.py Copiar codigo completo
 import base64
+import hashlib
+import hmac
+import json
 import os
+import secrets
 import re
 import tempfile
 import time
@@ -11,8 +16,18 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("PDF_API_KEY", "valor_antiguo")
-MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(45 * 1024 * 1024)))
+API_KEY = os.environ.get("PDF_API_KEY", "").strip()
+MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(80 * 1024 * 1024)))
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin", "*")
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Upload-Token, X-API-Key"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 
 def check_api_key(req) -> bool:
@@ -394,6 +409,210 @@ def analyze_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
 # FUNCIONES MODULARES PARA INGESTA GENERAL
 # =====================================================
 
+
+# =====================================================
+# EXPEDIENTE INTELIGENTE - FASE 1
+# OCR selectivo y segmentacion preliminar revisable
+# =====================================================
+OCR_ENABLED = str(os.environ.get("OCR_ENABLED", "true")).strip().lower() not in {"0", "false", "no"}
+OCR_LANGUAGE = str(os.environ.get("OCR_LANGUAGE", "spa+eng")).strip() or "spa+eng"
+OCR_DPI = int(os.environ.get("OCR_DPI", "180"))
+OCR_MIN_CHARS = int(os.environ.get("OCR_MIN_CHARS", "80"))
+OCR_MAX_PAGES_REQUEST = int(os.environ.get("OCR_MAX_PAGES_REQUEST", "160"))
+
+
+def ocr_page_selective(page, direct_text: str = "") -> Dict[str, Any]:
+    direct_text = normalize_text(direct_text)
+    result = {
+        "texto": direct_text,
+        "metodoLectura": "TEXTO_DIGITAL" if direct_text else "SIN_TEXTO",
+        "ocrIntentado": False,
+        "ocrExitoso": False,
+        "idiomaOCR": "",
+        "errorOCR": "",
+    }
+    if len(direct_text) >= OCR_MIN_CHARS or not OCR_ENABLED:
+        return result
+    languages = [OCR_LANGUAGE]
+    if OCR_LANGUAGE != "eng":
+        languages.append("eng")
+    result["ocrIntentado"] = True
+    for language in languages:
+        try:
+            text_page = page.get_textpage_ocr(language=language, dpi=OCR_DPI, full=True)
+            ocr_text = normalize_text(page.get_text("text", textpage=text_page) or "")
+            if len(ocr_text) > len(result["texto"]):
+                result.update({
+                    "texto": ocr_text,
+                    "metodoLectura": "OCR_TESSERACT",
+                    "ocrExitoso": True,
+                    "idiomaOCR": language,
+                    "errorOCR": "",
+                })
+                return result
+            result["errorOCR"] = "OCR_SIN_MEJORA"
+        except Exception as exc:
+            result["errorOCR"] = str(exc)
+    return result
+
+
+def classify_expediente_page(text: str) -> str:
+    n = normalize_for_search(text)
+    rules = [
+        ("ACTA_NOTIFICACION_JUDICIAL", ["acta de notificacion", "oficina de comunicaciones judiciales", "forma de notificacion"]),
+        ("MINUTA_AUDIENCIA", ["minuta audiencia", "audiencia preliminar", "ajuste de pretensiones"]),
+        ("CONCLUSIONES_PROCESALES", ["presentar las conclusiones requeridas", "conclusiones por escrito", "peticion final"]),
+        ("CONTESTACION_DEMANDA", ["contestar en tiempo y forma", "contestacion de demanda", "sobre el acto consentido"]),
+        ("DEMANDA_CONTENCIOSA", ["tribunal contencioso administrativo", "parte actora", "petitoria", "derecho violentado"]),
+        ("RESOLUCION_JUDICIAL", ["tribunal contencioso administrativo", "notifiquese", "juez tramitador"]),
+        ("CERTIFICACION", ["certifica que", "certificacion", "vid 573"]),
+        ("CORREO_ELECTRONICO", ["de:", "enviado:", "para:", "asunto:", "aviso de confidencialidad"]),
+        ("HISTORIAL_ACADEMICO", ["historial academico", "creditos", "promedio ponderado"]),
+        ("PUBLICACION_INSTITUCIONAL", ["facebook.com", "resultados de beca", "campus estudiantil"]),
+        ("REGLAMENTO", ["reglamento", "capitulo", "articulo"]),
+    ]
+    scored = []
+    for doc_type, terms in rules:
+        score = sum(1 for term in terms if term in n)
+        if score:
+            scored.append((score, doc_type))
+    return max(scored)[1] if scored else "DOCUMENTO_JURIDICO_GENERAL"
+
+
+def extract_expediente_number(text: str) -> str:
+    m = re.search(r"\b([0-9]{2}-[0-9]{5,8}-[0-9]{4}-[A-Za-z]{2})\b", normalize_text(text))
+    return m.group(1).upper() if m else ""
+
+
+def page_quality(text: str) -> str:
+    length = len(normalize_text(text))
+    if length >= 700:
+        return "ALTA"
+    if length >= 180:
+        return "MEDIA"
+    if length > 0:
+        return "BAJA"
+    return "NO_LEGIBLE"
+
+
+def is_new_subdocument(current: Dict[str, Any], previous: Dict[str, Any]) -> bool:
+    if not previous:
+        return True
+    current_type = current.get("tipoDocumento")
+    previous_type = previous.get("tipoDocumento")
+    preview = normalize_for_search(current.get("textoPreview", ""))
+    strong_start = any(preview.startswith(x) for x in [
+        "oficina de comunicaciones judiciales", "tribunal contencioso administrativo",
+        "de:", "fecha:", "minuta audiencia", "certifica que", "senores tribunal"
+    ])
+    if current_type != previous_type and strong_start:
+        return True
+    if current_type in {"ACTA_NOTIFICACION_JUDICIAL", "CORREO_ELECTRONICO", "CERTIFICACION"} and current_type != previous_type:
+        return True
+    if current.get("expediente") and previous.get("expediente") and current["expediente"] != previous["expediente"]:
+        return True
+    return False
+
+
+def segment_unified_pdf_bytes(pdf_bytes: bytes, filename: str = "", page_start: int = 1, page_end: int = 0) -> Dict[str, Any]:
+    doc = None
+    try:
+        doc, _ = open_pdf_from_bytes(pdf_bytes)
+        total_pages = int(doc.page_count or 0)
+        start = max(1, int(page_start or 1))
+        end = min(total_pages, int(page_end or total_pages))
+        if end < start:
+            raise ValueError("Rango de paginas invalido.")
+        pages = []
+        ocr_attempts = 0
+        for page_index in range(start - 1, end):
+            page = doc.load_page(page_index)
+            direct = get_page_text(page) or get_page_blocks_text(page)
+            if len(normalize_text(direct)) < OCR_MIN_CHARS and ocr_attempts < OCR_MAX_PAGES_REQUEST:
+                read = ocr_page_selective(page, direct)
+                if read.get("ocrIntentado"):
+                    ocr_attempts += 1
+            else:
+                read = {"texto": normalize_text(direct), "metodoLectura": "TEXTO_DIGITAL" if direct else "SIN_TEXTO", "ocrIntentado": False, "ocrExitoso": False, "idiomaOCR": "", "errorOCR": "LIMITE_OCR" if not direct else ""}
+            text = normalize_text(read.get("texto"))
+            pages.append({
+                "paginaPdf": page_index + 1,
+                "tituloDetectado": modular_detect_page_title(text),
+                "tipoDocumento": classify_expediente_page(text[:6000]),
+                "expediente": extract_expediente_number(text[:5000]),
+                "textoPreview": text[:900],
+                "caracteres": len(text),
+                "calidadLectura": page_quality(text),
+                "metodoLectura": read.get("metodoLectura"),
+                "ocrIntentado": read.get("ocrIntentado", False),
+                "ocrExitoso": read.get("ocrExitoso", False),
+                "idiomaOCR": read.get("idiomaOCR", ""),
+                "errorOCR": read.get("errorOCR", ""),
+                "requiereRevisionHumana": page_quality(text) in {"BAJA", "NO_LEGIBLE"},
+            })
+        segments = []
+        current = None
+        previous = None
+        for item in pages:
+            if current is None or is_new_subdocument(item, previous):
+                if current:
+                    segments.append(current)
+                current = {
+                    "paginaInicioPdf": item["paginaPdf"],
+                    "paginaFinPdf": item["paginaPdf"],
+                    "tipoDocumento": item["tipoDocumento"],
+                    "titulo": item["tituloDetectado"],
+                    "expediente": item["expediente"],
+                    "requiereRevisionHumana": item["requiereRevisionHumana"],
+                }
+            else:
+                current["paginaFinPdf"] = item["paginaPdf"]
+                current["requiereRevisionHumana"] = current["requiereRevisionHumana"] or item["requiereRevisionHumana"]
+            previous = item
+        if current:
+            segments.append(current)
+        for index, segment in enumerate(segments, 1):
+            segment["idSubdocumento"] = f"SUB-{index:04d}"
+            segment["totalPaginas"] = segment["paginaFinPdf"] - segment["paginaInicioPdf"] + 1
+            segment["confianzaSegmentacion"] = "MEDIA" if segment["requiereRevisionHumana"] else "ALTA"
+        unreadable = [p["paginaPdf"] for p in pages if p["calidadLectura"] == "NO_LEGIBLE"]
+        low = [p["paginaPdf"] for p in pages if p["calidadLectura"] == "BAJA"]
+        ocr_ok = [p["paginaPdf"] for p in pages if p["ocrExitoso"]]
+        ocr_failed = [p["paginaPdf"] for p in pages if p["ocrIntentado"] and not p["ocrExitoso"]]
+        warnings = []
+        if unreadable:
+            warnings.append(f"{len(unreadable)} paginas permanecen sin texto legible.")
+        if low:
+            warnings.append(f"{len(low)} paginas tienen lectura de baja calidad.")
+        return {
+            "ok": True,
+            "versionServicio": "1.4.0",
+            "modo": "SEGMENTACION_PRELIMINAR_REVISABLE",
+            "filename": filename,
+            "totalPaginasDocumento": total_pages,
+            "paginaInicioProcesada": start,
+            "paginaFinProcesada": end,
+            "totalPaginasProcesadas": len(pages),
+            "totalPaginasOCR": len(ocr_ok),
+            "paginasOCRExitoso": ocr_ok,
+            "paginasOCRFallido": ocr_failed,
+            "paginasNoLegibles": unreadable,
+            "paginasBajaCalidad": low,
+            "subdocumentos": segments,
+            "paginas": pages,
+            "advertencias": warnings,
+            "requiereRevisionHumana": bool(unreadable or low or any(s["requiereRevisionHumana"] for s in segments)),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": "ERROR_SEGMENTACION_EXPEDIENTE", "mensaje": str(exc), "filename": filename}
+    finally:
+        try:
+            if doc:
+                doc.close()
+        except Exception:
+            pass
+
+
 def modular_detect_page_title(text: str) -> str:
     text = text or ""
     lines = []
@@ -494,14 +713,17 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
             "search": "/search",
             "article": "/article",
             "ingestar_pdf_modular": "/ingestar_pdf_modular",
-            "ingestar_pdf_modular_lote": "/ingestar_pdf_modular_lote"
+            "ingestar_pdf_modular_lote": "/ingestar_pdf_modular_lote",
+            "segmentar_expediente": "/segmentar_expediente",
+            "crear_token_carga": "/crear_token_carga",
+            "segmentar_expediente_archivo": "/segmentar_expediente_archivo"
         }
     })
 
@@ -510,7 +732,7 @@ def index():
 def health():
     if not check_api_key(request):
         return unauthorized_response()
-    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF", "version": "1.3.0"})
+    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF + Tesseract OCR", "version": "1.4.0"})
 
 
 @app.route("/analyze", methods=["POST"])
@@ -888,6 +1110,80 @@ def ingestar_pdf_modular():
         except Exception:
             pass
         cleanup_temp(tmp_path)
+
+
+
+
+def create_upload_token(ttl_seconds: int = 600) -> str:
+    if not API_KEY:
+        raise ValueError("PDF_API_KEY no esta configurada.")
+    payload = {"exp": int(time.time()) + max(60, min(int(ttl_seconds), 1800)), "nonce": secrets.token_urlsafe(12)}
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    signature = hmac.new(API_KEY.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return encoded + "." + signature
+
+
+def validate_upload_token(token: str) -> bool:
+    try:
+        encoded, signature = str(token or "").split(".", 1)
+        expected = hmac.new(API_KEY.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return False
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        return int(payload.get("exp", 0)) >= int(time.time())
+    except Exception:
+        return False
+
+
+@app.route("/crear_token_carga", methods=["POST"])
+def crear_token_carga():
+    if not check_api_key(request):
+        return unauthorized_response()
+    data = request.get_json(silent=True) or {}
+    token = create_upload_token(int(data.get("ttlSegundos") or 600))
+    return jsonify({"ok": True, "token": token, "expiraEnSegundos": 600, "uploadUrl": request.url_root.rstrip("/") + "/segmentar_expediente_archivo"})
+
+
+@app.route("/segmentar_expediente_archivo", methods=["POST"])
+def segmentar_expediente_archivo():
+    token = request.form.get("token") or request.headers.get("X-Upload-Token", "")
+    if not validate_upload_token(token):
+        return jsonify({"ok": False, "error": "TOKEN_CARGA_INVALIDO_O_VENCIDO"}), 401
+    uploaded = request.files.get("archivo")
+    if not uploaded:
+        return jsonify({"ok": False, "error": "ARCHIVO_PDF_REQUERIDO"}), 400
+    pdf_bytes = uploaded.read()
+    if not pdf_bytes or len(pdf_bytes) > MAX_PDF_BYTES:
+        return jsonify({"ok": False, "error": "TAMANO_PDF_INVALIDO", "maxBytes": MAX_PDF_BYTES}), 400
+    try:
+        page_start = int(request.form.get("paginaInicio") or 1)
+        page_end = int(request.form.get("paginaFin") or 0)
+    except Exception:
+        return jsonify({"ok": False, "error": "RANGO_PAGINAS_INVALIDO"}), 400
+    result = segment_unified_pdf_bytes(pdf_bytes, uploaded.filename or "expediente.pdf", page_start, page_end)
+    return jsonify(result), (200 if result.get("ok") else 500)
+
+
+@app.route("/segmentar_expediente", methods=["POST"])
+def segmentar_expediente():
+    if not check_api_key(request):
+        return unauthorized_response()
+    data = request.get_json(silent=True) or {}
+    try:
+        pdf_bytes = decode_pdf_base64(data.get("pdf_base64") or data.get("pdfBase64") or "")
+        page_start = int(data.get("paginaInicio") or 1)
+        page_end = int(data.get("paginaFin") or 0)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "SOLICITUD_INVALIDA", "mensaje": str(exc)}), 400
+    result = segment_unified_pdf_bytes(
+        pdf_bytes,
+        str(data.get("filename") or data.get("nombreArchivo") or ""),
+        page_start,
+        page_end,
+    )
+    return jsonify(result), (200 if result.get("ok") else 500)
 
 
 if __name__ == "__main__":

@@ -588,6 +588,7 @@ def segment_unified_pdf_bytes(pdf_bytes: bytes, filename: str = "", page_start: 
                 "tituloDetectado": modular_detect_page_title(text),
                 "tipoDocumento": classify_expediente_page(text[:6000]),
                 "expediente": extract_expediente_number(text[:5000]),
+                "textoCompleto": text,
                 "textoPreview": text[:900],
                 "caracteres": len(text),
                 "calidadLectura": page_quality(text),
@@ -634,7 +635,7 @@ def segment_unified_pdf_bytes(pdf_bytes: bytes, filename: str = "", page_start: 
             warnings.append(f"{len(low)} paginas tienen lectura de baja calidad.")
         return {
             "ok": True,
-            "versionServicio": "1.4.1",
+            "versionServicio": "1.5.0",
             "modo": "SEGMENTACION_PRELIMINAR_REVISABLE",
             "filename": filename,
             "totalPaginasDocumento": total_pages,
@@ -761,7 +762,7 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.4.1",
+        "version": "1.5.0",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
@@ -780,7 +781,7 @@ def index():
 def health():
     if not check_api_key(request):
         return unauthorized_response()
-    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF + Tesseract OCR", "version": "1.4.1", "tessdataConfigurado": bool(TESSDATA_DIRECTORY)})
+    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF + Tesseract OCR", "version": "1.5.0", "tessdataConfigurado": bool(TESSDATA_DIRECTORY)})
 
 
 @app.route("/analyze", methods=["POST"])

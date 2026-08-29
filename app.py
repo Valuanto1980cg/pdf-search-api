@@ -635,7 +635,7 @@ def segment_unified_pdf_bytes(pdf_bytes: bytes, filename: str = "", page_start: 
             warnings.append(f"{len(low)} paginas tienen lectura de baja calidad.")
         return {
             "ok": True,
-            "versionServicio": "1.5.0",
+            "versionServicio": "1.6.0",
             "modo": "SEGMENTACION_PRELIMINAR_REVISABLE",
             "filename": filename,
             "totalPaginasDocumento": total_pages,
@@ -762,7 +762,7 @@ def index():
         "ok": True,
         "service": "PDF Search API",
         "engine": "Python + PyMuPDF",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "endpoints": {
             "health": "/health",
             "analyze": "/analyze",
@@ -772,7 +772,8 @@ def index():
             "ingestar_pdf_modular_lote": "/ingestar_pdf_modular_lote",
             "segmentar_expediente": "/segmentar_expediente",
             "crear_token_carga": "/crear_token_carga",
-            "segmentar_expediente_archivo": "/segmentar_expediente_archivo"
+            "segmentar_expediente_archivo": "/segmentar_expediente_archivo",
+            "render_page": "/render-page"
         }
     })
 
@@ -781,7 +782,7 @@ def index():
 def health():
     if not check_api_key(request):
         return unauthorized_response()
-    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF + Tesseract OCR", "version": "1.5.0", "tessdataConfigurado": bool(TESSDATA_DIRECTORY)})
+    return jsonify({"ok": True, "service": "PDF Search API", "engine": "PyMuPDF + Tesseract OCR", "version": "1.6.0", "tessdataConfigurado": bool(TESSDATA_DIRECTORY)})
 
 
 @app.route("/analyze", methods=["POST"])
@@ -1234,6 +1235,131 @@ def segmentar_expediente():
     )
     return jsonify(result), (200 if result.get("ok") else 500)
 
+
+
+# =====================================================
+# VISOR PROPIO PKP - RENDERIZADO DE PAGINA
+# Version 1.6.0
+# =====================================================
+RENDER_MIN_ZOOM = float(os.environ.get("RENDER_MIN_ZOOM", "0.8"))
+RENDER_MAX_ZOOM = float(os.environ.get("RENDER_MAX_ZOOM", "2.5"))
+RENDER_DEFAULT_ZOOM = float(os.environ.get("RENDER_DEFAULT_ZOOM", "1.5"))
+RENDER_MAX_PIXELS = int(os.environ.get("RENDER_MAX_PIXELS", "12000000"))
+RENDER_MAX_MATCHES = int(os.environ.get("RENDER_MAX_MATCHES", "100"))
+
+
+def clamp_render_zoom(value: Any) -> float:
+    try:
+        zoom = float(value or RENDER_DEFAULT_ZOOM)
+    except Exception:
+        zoom = RENDER_DEFAULT_ZOOM
+    return max(RENDER_MIN_ZOOM, min(zoom, RENDER_MAX_ZOOM))
+
+
+def important_query_words(query: str) -> List[str]:
+    stopwords = {
+        "a", "al", "ante", "bajo", "como", "con", "contra", "de", "del",
+        "desde", "durante", "e", "el", "en", "entre", "es", "esta", "este",
+        "la", "las", "lo", "los", "ni", "o", "para", "pero", "por", "que",
+        "se", "sin", "sobre", "su", "sus", "un", "una", "uno", "y",
+    }
+    result = []
+    seen = set()
+    for word in normalize_words(query):
+        if len(word) < 3 or word in stopwords or word in seen:
+            continue
+        seen.add(word)
+        result.append(word)
+    return sorted(result, key=len, reverse=True)
+
+
+def search_page_rectangles(page, query: str) -> Dict[str, Any]:
+    query = normalize_text(query)
+    if not query:
+        return {"match_type": "none", "searched_terms": [], "rects": []}
+    exact = list(page.search_for(query, quads=False) or [])
+    if exact:
+        return {"match_type": "exact", "searched_terms": [query], "rects": exact[:RENDER_MAX_MATCHES]}
+    rects = []
+    used = []
+    for term in important_query_words(query):
+        found = list(page.search_for(term, quads=False) or [])
+        if found:
+            used.append(term)
+            rects.extend(found)
+        if len(rects) >= RENDER_MAX_MATCHES:
+            break
+    return {"match_type": "partial" if rects else "none", "searched_terms": used, "rects": rects[:RENDER_MAX_MATCHES]}
+
+
+def render_pdf_page_bytes(pdf_bytes: bytes, page_number: int, query: str = "", zoom: float = 1.5, bake_highlights: bool = True) -> Dict[str, Any]:
+    doc = None
+    try:
+        doc, _ = open_pdf_from_bytes(pdf_bytes)
+        total_pages = int(doc.page_count or 0)
+        page_number = int(page_number)
+        if page_number < 1 or page_number > total_pages:
+            raise ValueError(f"Pagina fuera de rango: {page_number}. Total: {total_pages}.")
+        zoom = clamp_render_zoom(zoom)
+        page = doc.load_page(page_number - 1)
+        area = float(page.rect.width * page.rect.height)
+        if area * zoom * zoom > RENDER_MAX_PIXELS:
+            zoom = max(RENDER_MIN_ZOOM, min(zoom, (RENDER_MAX_PIXELS / max(area, 1.0)) ** 0.5))
+        search = search_page_rectangles(page, query)
+        rects = search["rects"]
+        if bake_highlights and rects:
+            shape = page.new_shape()
+            for rect in rects:
+                shape.draw_rect(rect)
+            shape.finish(color=(0.95, 0.65, 0.0), fill=(1.0, 0.92, 0.20), width=0.8, fill_opacity=0.38, stroke_opacity=0.90)
+            shape.commit(overlay=True)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+        png = pixmap.tobytes("png")
+        matches = [{
+            "x0": round(float(r.x0) * zoom, 2), "y0": round(float(r.y0) * zoom, 2),
+            "x1": round(float(r.x1) * zoom, 2), "y1": round(float(r.y1) * zoom, 2),
+            "width": round(float(r.width) * zoom, 2), "height": round(float(r.height) * zoom, 2)
+        } for r in rects]
+        return {
+            "ok": True, "versionServicio": "1.6.0", "page": page_number,
+            "page_index": page_number - 1, "total_pages": total_pages,
+            "zoom": round(zoom, 3), "width": int(pixmap.width), "height": int(pixmap.height),
+            "mime_type": "image/png", "image_base64": base64.b64encode(png).decode("ascii"),
+            "image_bytes": len(png), "query": normalize_text(query),
+            "match_type": search["match_type"], "searched_terms": search["searched_terms"],
+            "match_count": len(rects), "matches": matches,
+            "highlights_baked": bool(bake_highlights and rects)
+        }
+    except Exception as exc:
+        return {"ok": False, "versionServicio": "1.6.0", "error": "ERROR_RENDER_PAGE", "mensaje": str(exc), "page": page_number}
+    finally:
+        try:
+            if doc:
+                doc.close()
+        except Exception:
+            pass
+
+
+@app.route("/render-page", methods=["POST", "OPTIONS"])
+def render_page():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_api_key(request):
+        return unauthorized_response()
+    data = request.get_json(silent=True) or {}
+    try:
+        pdf_bytes = decode_pdf_base64(data.get("pdf_base64") or data.get("pdfBase64") or "")
+    except Exception as exc:
+        return jsonify({"ok": False, "versionServicio": "1.6.0", "error": "PDF_INVALIDO", "mensaje": str(exc)}), 400
+    result = render_pdf_page_bytes(
+        pdf_bytes=pdf_bytes,
+        page_number=data.get("page") or data.get("pagina") or 1,
+        query=data.get("query") or data.get("consulta") or "",
+        zoom=data.get("zoom") or RENDER_DEFAULT_ZOOM,
+        bake_highlights=bool(data.get("bake_highlights", True)),
+    )
+    result["filename"] = data.get("filename") or data.get("nombreArchivo") or ""
+    return jsonify(result), (200 if result.get("ok") else 400)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
